@@ -2,7 +2,7 @@
 4 models in a trenchcoat walk into a bar (3090 edition)
 
 # usage
-clone the repo and use `uv` or something
+clone the repo and use `uv` or something:
 
 ```shell
 uv venv --python 3.12
