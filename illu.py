@@ -81,6 +81,8 @@ class Chat(StreamHandler):
         if system is not None:
             self.llm_ctx.append({"role": "system", "content": system})
 
+        self.system = system
+
     def receive(self, audio: tuple[int, np.ndarray]) -> None:
         # NOTE: silero-vad & whisper want 16KHz, CSM wants 24KHz, all want normalized float32
         rate, frame = audio
@@ -228,7 +230,7 @@ class Chat(StreamHandler):
                 self.csm_ctx.append(csmc)
 
     def copy(self) -> StreamHandler:
-        return Chat(self.vad, self.stt, self.llm, self.csm)
+        return Chat(self.vad, self.stt, self.llm, self.csm, llm_model=self.llm_model, system=self.system)
 
     def start_up(self) -> None: # called on stream start
         pass
