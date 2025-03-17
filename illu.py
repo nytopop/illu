@@ -6,6 +6,7 @@
 #   improves TTFF significantly, as we can utilize ~600ms pause duration as part of our gen budget
 # - CSM: torch compile
 # - CSM: supposedly kv caches for backbone and decoder are on CPU (???)
+# - CSM: we can utilize kv cache instead of clearing on every iter
 # - latency is the enemy; kill it with fire
 #
 # processes:
