@@ -8,6 +8,7 @@ from models import Model
 from moshi.models import loaders
 from tokenizers.processors import TemplateProcessing
 from transformers import AutoTokenizer
+from contextlib import ExitStack
 
 
 @dataclass
@@ -106,11 +107,12 @@ class Generator:
         text: str,
         speaker: int,
         context: List[Segment],
-        max_audio_length_ms: float = 90_000,
+        max_audio_length_ms: float = 30_000,
         temperature: float = 0.9,
         topk: int = 50,
     ) -> torch.Tensor:
         self._model.reset_caches()
+        self._audio_tokenizer._stop_streaming()
 
         max_audio_frames = int(max_audio_length_ms / 80)
         tokens, tokens_mask = [], []
@@ -135,12 +137,14 @@ class Generator:
         if curr_tokens.size(1) >= max_seq_len:
             raise ValueError(f"Inputs too long, must be below max_seq_len - max_audio_frames: {max_seq_len}")
 
+        self._audio_tokenizer._start_streaming(1, ExitStack())
+
         for _ in range(max_audio_frames):
             sample = self._model.generate_frame(curr_tokens, curr_tokens_mask, curr_pos, temperature, topk)
             if torch.all(sample == 0):
                 break  # eos
 
-            samples.append(sample)
+            frame = self._audio_tokenizer.decode(torch.stack([sample]).permute(1, 2, 0)).squeeze(0).squeeze(0)
 
             curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
             curr_tokens_mask = torch.cat(
@@ -148,6 +152,12 @@ class Generator:
             ).unsqueeze(1)
             curr_pos = curr_pos[:, -1:] + 1
 
+            yield frame, sample
+
+        return self._audio_tokenizer.decode(torch.stack(samples).permute(1, 2, 0)).squeeze(0).squeeze(0)
+
+    @torch.inference_mode()
+    def decode_samples(self, samples):
         return self._audio_tokenizer.decode(torch.stack(samples).permute(1, 2, 0)).squeeze(0).squeeze(0)
 
 
