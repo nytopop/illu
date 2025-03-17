@@ -18,6 +18,7 @@ from queue   import Queue, Empty
 from silero_vad             import load_silero_vad, get_speech_timestamps
 from distil_whisper_fastrtc import get_stt_model
 from openai                 import OpenAI
+from generator              import load_csm_1b
 
 import numpy  as np
 import gradio as gr
@@ -25,13 +26,14 @@ import time
 import os
 
 class Chat(StreamHandler):
-    def __init__(self, vad, stt, llm) -> None:
+    def __init__(self, vad, stt, llm, csm) -> None:
         # output at 12.5Hz or 80ms/frame for alignment with CSM (let's avoid any unnecessary buffering)
         super().__init__("mono", input_sample_rate=16000, output_sample_rate=24000, output_frame_size=1920)
 
         self.vad = vad
         self.stt = stt
         self.llm = llm
+        self.csm = csm
 
         self.paused_at = time.process_time()
         self.rx_buf = np.empty(0, dtype=np.float32)
@@ -114,7 +116,7 @@ class Chat(StreamHandler):
             return None
 
     def copy(self) -> StreamHandler:
-        return Chat(self.vad, self.stt, self.llm)
+        return Chat(self.vad, self.stt, self.llm, self.csm)
 
     def start_up(self) -> None: # called on stream start
         pass
@@ -135,10 +137,11 @@ if __name__ == "__main__":
     api_base = os.environ.get("OPENAI_BASE_URL") or "http://127.0.0.1:8000/v1"
     llm = OpenAI(api_key=api_key, base_url=api_base)
 
-    # TODO: CSM: figure out how to say it
+    # CSM: figure out how to say it
+    csm = load_csm_1b(device="cuda")
 
     # gg
-    chat = Chat(vad, stt, llm)
+    chat = Chat(vad, stt, llm, csm)
 
     # TODO: gradio shit
     #
