@@ -107,7 +107,7 @@ class Generator:
         text: str,
         speaker: int,
         context: List[Segment],
-        max_audio_length_ms: float = 30_000,
+        max_audio_length_ms: float = 12_000,
         temperature: float = 0.9,
         topk: int = 50,
     ) -> torch.Tensor:
