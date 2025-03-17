@@ -19,3 +19,5 @@ torchao==0.9.0
 
 # LLM
 openai
+
+click
