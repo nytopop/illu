@@ -25,12 +25,13 @@ import time
 import os
 
 class Chat(StreamHandler):
-    def __init__(self, vad, stt) -> None:
+    def __init__(self, vad, stt, llm) -> None:
         # output at 12.5Hz or 80ms/frame for alignment with CSM (let's avoid any unnecessary buffering)
         super().__init__("mono", input_sample_rate=16000, output_sample_rate=24000, output_frame_size=1920)
 
         self.vad = vad
         self.stt = stt
+        self.llm = llm
 
         self.paused_at = time.process_time()
         self.rx_buf = np.empty(0, dtype=np.float32)
@@ -113,7 +114,7 @@ class Chat(StreamHandler):
             return None
 
     def copy(self) -> StreamHandler:
-        return Chat(self.vad, self.stt)
+        return Chat(self.vad, self.stt, self.llm)
 
     def start_up(self) -> None: # called on stream start
         pass
@@ -137,7 +138,7 @@ if __name__ == "__main__":
     # TODO: CSM: figure out how to say it
 
     # gg
-    chat = Chat(vad, stt)
+    chat = Chat(vad, stt, llm)
 
     # TODO: gradio shit
     #
