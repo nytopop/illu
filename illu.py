@@ -73,11 +73,10 @@ class Chat(StreamHandler):
         self.sp_buf = []
         self.speech = ""
         self.flight = None
-        self.flight_out = None
         self.queued = Queue()
 
         self.llm_ctx = []
-        self.csm_ctx = bootleg_maya
+        self.csm_ctx = []
         if system is not None:
             self.llm_ctx.append({"role": "system", "content": system})
 
@@ -95,13 +94,17 @@ class Chat(StreamHandler):
         if self.buffer_frame_with_vad((rate, frame)):
             # re-transcribe the whole inflight speech buffer
             sp_buf = np.concatenate(self.sp_buf)
-            speech = self.stt.stt((rate, sp_buf))
+            try:
+                speech = self.stt.stt((rate, sp_buf))
+            except:
+                speech = self.speech
 
             # does it change the transcription? some 'speech' sounds don't transcribe intelligibly
             if speech != self.speech:
                 self.cancel_flight()
                 self.speech = speech
                 self.flight = self.gen_reply((rate, sp_buf), speech, true_start)
+                self.queued = Queue()
                 print(f"transcription: {speech}")
 
         # once we transition into the paused state, prune sp_buf and speech
@@ -152,8 +155,7 @@ class Chat(StreamHandler):
         sp_buf = torchaudio.functional.resample(torch.tensor(sp_buf).squeeze(0), orig_freq=rate, new_freq=24000)
 
         # build CSM context
-        csm_ctx = self.csm_ctx
-        # csm_ctx = bootleg_maya
+        csm_ctx = bootleg_maya + self.csm_ctx[-7:]
         csm_ctx.append(Segment(text=speech, speaker=1, audio=sp_buf))
         csm_gen = []
 
@@ -168,10 +170,8 @@ class Chat(StreamHandler):
             frame = frame.unsqueeze(0).cpu().numpy()
             yield (24000, frame)
 
-        self.flight_out = (
-            {"role": "assistant", "content": message},
-            Segment(text=message, speaker=0, audio=torch.cat(csm_gen)),
-        )
+        self.llm_ctx.append({"role": "assistant", "content": message})
+        self.csm_ctx.append(Segment(text=message, speaker=0, audio=torch.cat(csm_gen)))
 
     def input_paused(self, threshold_ms: float = 600) -> bool:
         if self.paused_at is None:
@@ -224,10 +224,6 @@ class Chat(StreamHandler):
             except StopIteration:
                 super().reset()
                 self.flight = None
-                llmc, csmc = self.flight_out
-                self.flight_out = None
-                self.llm_ctx.append(llmc)
-                self.csm_ctx.append(csmc)
 
     def copy(self) -> StreamHandler:
         return Chat(self.vad, self.stt, self.llm, self.csm, llm_model=self.llm_model, system=self.system)
