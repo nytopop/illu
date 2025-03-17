@@ -107,7 +107,7 @@ class Generator:
         text: str,
         speaker: int,
         context: List[Segment],
-        max_audio_length_ms: float = 12_000,
+        max_audio_length_ms: float = 15_000,
         temperature: float = 0.9,
         topk: int = 50,
     ) -> torch.Tensor:
@@ -144,14 +144,13 @@ class Generator:
             if torch.all(sample == 0):
                 break  # eos
 
-            frame = self._audio_tokenizer.decode(torch.stack([sample]).permute(1, 2, 0)).squeeze(0).squeeze(0)
-
             curr_tokens = torch.cat([sample, torch.zeros(1, 1).long().to(self.device)], dim=1).unsqueeze(1)
             curr_tokens_mask = torch.cat(
                 [torch.ones_like(sample).bool(), torch.zeros(1, 1).bool().to(self.device)], dim=1
             ).unsqueeze(1)
             curr_pos = curr_pos[:, -1:] + 1
 
+            frame = self._audio_tokenizer.decode(torch.stack([sample]).permute(1, 2, 0)).squeeze(0).squeeze(0)
             yield frame
 
 
