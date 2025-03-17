@@ -1,18 +1,3 @@
-# impl notes in no particular order
-#
-# performance:
-# - stream transcription instead of sequentially batching pause detection into transcription ops
-#   then generate immediately on each transcribed word, but only yield the stream upon sufficient pause
-#   improves TTFF significantly, as we can utilize ~600ms pause duration as part of our gen budget
-# - CSM: torch compile
-# - CSM: supposedly kv caches for backbone and decoder are on CPU (???)
-# - CSM: we can utilize kv cache instead of clearing on every iter
-# - latency is the enemy; kill it with fire
-#
-# processes:
-# - silence-fill: treat silence as tacit permission to steer conversation arbitrarily
-# - profiler: active/passive probes for interests, relationships, likes, dislikes, etc
-#   in short, it should actively try to get to know you, and store that information for richer context
 from fastrtc                import Stream, StreamHandler
 from fastrtc.tracks         import EmitType
 from silero_vad             import load_silero_vad, get_speech_timestamps
