@@ -152,13 +152,7 @@ class Generator:
             ).unsqueeze(1)
             curr_pos = curr_pos[:, -1:] + 1
 
-            yield frame, sample
-
-        return self._audio_tokenizer.decode(torch.stack(samples).permute(1, 2, 0)).squeeze(0).squeeze(0)
-
-    @torch.inference_mode()
-    def decode_samples(self, samples):
-        return self._audio_tokenizer.decode(torch.stack(samples).permute(1, 2, 0)).squeeze(0).squeeze(0)
+            yield frame
 
 
 def load_csm_1b(device: str = "cuda") -> Generator:
