@@ -119,17 +119,11 @@ class Chat(StreamHandler):
         # build LLM context
         llm_ctx = self.llm_ctx
         llm_ctx.append({"role": "user", "content": speech})
-        message = ""
 
         s = time.process_time()
 
-        # streaming w/ fake yields to drive the state machine (for external cancellation if needed)
-        for token in self.llm.chat.completions.create(model=self.llm_model, messages=llm_ctx, stream=True):
-            delta = token.choices[0].delta.content
-            if delta is None:
-                continue
-            message += delta
-            yield None
+        resp = self.llm.chat.completions.create(model=self.llm_model, messages=llm_ctx, temperature=1.3)
+        message = resp.choices[0].message.content
 
         e = time.process_time()
         print(f"LLM in {(e-s)*1000}ms")
