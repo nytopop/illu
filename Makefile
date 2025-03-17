@@ -11,4 +11,4 @@ deps: .venv
 	uv pip install -r requirements.txt
 
 clean:
-	rm -rf .venv
+	rm -rf .venv __pycache__
