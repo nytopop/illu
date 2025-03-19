@@ -19,7 +19,7 @@ make
 have fun
 
 # configuration
-it checks `OPENAI_API_KEY` and `OPENAI_BASE_URL` env vars if you want to point it at whatever LLM. defaults to an
+it checks `OPENAI_API_KEY`, `OPENAI_BASE_URL`, and `OPENAI_MODEL` env vars to configure the LLM used. defaults to an
 api on localhost:8000 (if unset) to make it convenient for me personally.
 
 # resource reqs
