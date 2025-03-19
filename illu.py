@@ -62,8 +62,9 @@ class AudioEvent:
 #
 # Frame size is 31.25ms.
 class StreamingVAD:
-    # 0.1, 0.065 is a lil too willing to cancel
-    def __init__(self, window_size = 3, sp_threshold = 0.1, fi_threshold = 0.040):
+    # sp_threshold : increase until it reliably picks up beginning of voice
+    # fi_threshold : decrease until it reliably drops and stays dropped (no false drops)
+    def __init__(self, window_size = 5, sp_threshold = 0.04, fi_threshold = 0.0005):
         # config
         self.model = load_silero_vad()
         self.window_size = window_size
@@ -113,14 +114,15 @@ class StreamingVAD:
             self.sp_buf = np.concatenate((self.sp_buf, frame))
             return AudioEvent(p, speaking=self.sp_buf)
 
-        self.add_behind((rate, frame))
-
         # falling edge
         if (p <= self.fi_threshold) and self.speaking:
             self.speaking = False
             sp_buf = np.concatenate((self.sp_buf, frame))
             self.sp_buf = np.empty(0, dtype=np.float32)
+            self.behind = np.empty(0, dtype=np.float32)
             return AudioEvent(p, finished=sp_buf)
+
+        self.add_behind((rate, frame))
 
         if self.speaking:
             self.sp_buf = np.concatenate((self.sp_buf, frame))
