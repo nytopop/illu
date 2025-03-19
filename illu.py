@@ -1,13 +1,17 @@
-from fastrtc                import Stream, StreamHandler
+from fastrtc                import Stream, StreamHandler, WebRTC
 from fastrtc.tracks         import EmitType
-from silero_vad             import load_silero_vad, get_speech_timestamps
-from distil_whisper_fastrtc import get_stt_model
+from silero_vad             import load_silero_vad
+from distil_whisper_fastrtc import DistilWhisperSTT, get_stt_model
 from openai                 import OpenAI
-from typing                 import Generator, cast
 from generator              import load_csm_1b, Segment
-from queue                  import Queue, Empty
 
-# import gradio as gr
+from typing      import Generator, cast
+from queue       import Queue, Empty, Full
+from threading   import Thread
+from functools   import reduce
+from dataclasses import dataclass
+
+import gradio as gr
 import numpy  as np
 import torch
 import torchaudio
@@ -15,13 +19,16 @@ import click
 import time
 import os
 import sys
+import operator
 
-def load_audio_file(path):
+
+def load_audio_file(path, rate = 24000):
     audio_tensor, sample_rate = torchaudio.load(path)
     audio_tensor = torchaudio.functional.resample(
-        audio_tensor.squeeze(0), orig_freq=sample_rate, new_freq=24000
+        audio_tensor.squeeze(0), orig_freq=sample_rate, new_freq=rate
     )
     return audio_tensor
+
 
 # NOTE: this be where voice 'cloning' is configured. it's kinda shit; finetuning is the real play
 bootleg_maya = [
@@ -42,66 +49,136 @@ bootleg_maya = [
     ),
 ]
 
-class Chat(StreamHandler):
-    def __init__(self, vad, stt, llm, csm, llm_model="co-2", system=None) -> None:
-        # output at 50Hz or 20ms/frame for alignment with CSM and a reasonable amount of buffering
-        super().__init__("mono", input_sample_rate=16000, output_sample_rate=24000, output_frame_size=240)
 
-        self.vad = vad
+
+@dataclass
+class AudioEvent:
+    p: float
+    speaking: np.ndarray = None # a pending speech buffer
+    finished: np.ndarray = None # a complete speech buffer
+
+
+# A *fast* implementation of stateful streaming voice activity detection using the silero vad model.
+#
+# Frame size is 31.25ms.
+class StreamingVAD:
+    # 0.1, 0.065 is a lil too willing to cancel
+    def __init__(self, window_size = 3, sp_threshold = 0.1, fi_threshold = 0.040):
+        # config
+        self.model = load_silero_vad()
+        self.window_size = window_size
+        self.sp_threshold = sp_threshold
+        self.fi_threshold = fi_threshold
+
+        # state
+        self.speaking = False
+        self.window = []
+        self.behind = np.empty(0, dtype=np.float32)
+        self.in_buf = np.empty(0, dtype=np.float32)
+        self.sp_buf = np.empty(0, dtype=np.float32)
+
+    def get_events(self, audio: tuple[int, np.ndarray]):
+        rate, frames = audio
+
+        for frame in self.reframe(frames, 512 if (rate == 16000) else 256):
+            yield self.get_event((rate, frame))
+
+    def reframe(self, frames: np.ndarray, size: int):
+        self.in_buf = np.concatenate((self.in_buf, frames))
+
+        while len(self.in_buf) > size:
+            yield self.in_buf[:size]
+            self.in_buf = self.in_buf[size:]
+
+        if len(self.in_buf) == size:
+            yield self.in_buf
+            self.in_buf = np.empty(0, dtype=np.float32)
+
+    def get_event(self, audio: tuple[int, np.ndarray]):
+        rate, frame = audio
+        p = self.model(torch.Tensor(frame), rate).item()
+
+        if len(self.window) == 0:
+            self.window = [p] * self.window_size
+        else:
+            self.window = self.window[1:] + [p]
+
+        p = reduce(operator.mul, self.window)
+
+        # rising edge
+        if (p >= self.sp_threshold) and not self.speaking:
+            self.speaking = True
+            self.sp_buf = self.behind
+            self.add_behind((rate, frame))
+            self.sp_buf = np.concatenate((self.sp_buf, frame))
+            return AudioEvent(p, speaking=self.sp_buf)
+
+        self.add_behind((rate, frame))
+
+        # falling edge
+        if (p <= self.fi_threshold) and self.speaking:
+            self.speaking = False
+            sp_buf = np.concatenate((self.sp_buf, frame))
+            self.sp_buf = np.empty(0, dtype=np.float32)
+            return AudioEvent(p, finished=sp_buf)
+
+        if self.speaking:
+            self.sp_buf = np.concatenate((self.sp_buf, frame))
+            return AudioEvent(p, speaking=self.sp_buf)
+
+        return AudioEvent(p)
+
+    def add_behind(self, frame: tuple[int, np.ndarray]) -> None:
+        rate, frame = frame
+
+        if len(self.behind) >= rate:
+            self.behind = self.behind[len(frame):]
+
+        self.behind = np.concatenate((self.behind, frame))
+
+
+class Chat(StreamHandler):
+    def __init__(self, stt, llm, csm, llm_model="co-2", system=None) -> None:
+        super().__init__("mono", input_sample_rate=16000, output_sample_rate=24000, output_frame_size=120)
+
+        self.vad = StreamingVAD()
         self.stt = stt
         self.llm = llm
         self.llm_model = llm_model
         self.csm = csm
 
-        self.paused_at = time.process_time()
-        self.rx_buf = np.empty(0, dtype=np.float32)
-        self.sp_buf = []
-        self.speech = ""
         self.flight = None
-        self.queued = Queue()
-
         self.llm_ctx = []
         self.csm_ctx = []
         if system is not None:
             self.llm_ctx.append({"role": "system", "content": system})
-
         self.system = system
 
     def receive(self, audio: tuple[int, np.ndarray]) -> None:
-        # NOTE: silero-vad & whisper want 16KHz, CSM wants 24KHz, all want normalized float32
+        # silero-vad & whisper want 16KHz, CSM wants 24KHz
         rate, frame = audio
         assert rate == 16000
+
+        # everything wants normalized float32, preferably
         frame = np.frombuffer(frame, np.int16).astype(np.float32) / 32768.0
 
         true_start = time.process_time()
 
-        # are there any new speech chunks from running VAD over this frame and the past window?
-        if self.buffer_frame_with_vad((rate, frame)):
-            # re-transcribe the whole inflight speech buffer
-            sp_buf = np.concatenate(self.sp_buf)
-            try:
-                speech = self.stt.stt((rate, sp_buf))
-            except:
-                speech = self.speech
-
-            # does it change the transcription? some 'speech' sounds don't transcribe intelligibly
-            if speech != self.speech:
+        for event in self.vad.get_events((rate, frame)):
+            if event.speaking is not None:
                 self.cancel_flight()
-                self.speech = speech
-                self.flight = self.gen_reply((rate, sp_buf), speech, true_start)
-                self.queued = Queue()
+                self.clear_queue()
+
+            if event.finished is not None:
+                self.cancel_flight()
+
+                s0 = time.process_time()
+                speech = self.stt.stt((rate, event.finished))
+                s1 = time.process_time()
+                print(f"STT in {(s1-s0)*1000}ms")
+
+                self.flight = self.gen_reply((rate, event.finished), speech, true_start)
                 print(f"transcription: {speech}")
-
-        # once we transition into the paused state, prune sp_buf and speech
-        if len(self.sp_buf) > 0 and self.input_paused():
-            self.llm_ctx.append({"role": "user", "content": self.speech})
-
-            sp_buf = torch.tensor(np.concatenate(self.sp_buf)).squeeze(0)
-            sp_buf = torchaudio.functional.resample(sp_buf, orig_freq=rate, new_freq=24000)
-            self.csm_ctx.append(Segment(text=self.speech, speaker=1, audio=sp_buf))
-
-            self.sp_buf = []
-            self.speech = ""
 
     def cancel_flight(self):
         if self.flight is None:
@@ -110,102 +187,63 @@ class Chat(StreamHandler):
         try:
             if hasattr(self.flight, "close"):
                 cast(Generator[EmitType, None, None], self.flight).close()
-        except Exception as e:
-            print(f"error closing generator: {e}")
+        except:
+            pass
 
         self.flight = None
 
     def gen_reply(self, sp_buf: tuple[int, np.ndarray], speech, true_start):
-        # build LLM context
-        llm_ctx = self.llm_ctx
-        llm_ctx.append({"role": "user", "content": speech})
-
         s = time.process_time()
 
-        resp = self.llm.chat.completions.create(model=self.llm_model, messages=llm_ctx, temperature=1.3)
+        # build LLM context
+        self.llm_ctx.append({"role": "user", "content": speech})
+        resp = self.llm.chat.completions.create(model=self.llm_model, messages=self.llm_ctx, temperature=1)
         message = resp.choices[0].message.content
 
         e = time.process_time()
         print(f"LLM in {(e-s)*1000}ms")
         print(f"message: {message}")
 
-        # resampling to CSM 24KHz
+        s = time.process_time()
+
+        # resample to CSM 24KHz
         rate, sp_buf = sp_buf
         sp_buf = torchaudio.functional.resample(torch.tensor(sp_buf).squeeze(0), orig_freq=rate, new_freq=24000)
 
         # build CSM context
-        csm_ctx = bootleg_maya + self.csm_ctx[-7:]
-        csm_ctx.append(Segment(text=speech, speaker=1, audio=sp_buf))
+        self.csm_ctx.append(Segment(text=speech, speaker=1, audio=sp_buf))
+        csm_ctx = list(bootleg_maya) + list(self.csm_ctx[-3:])
         csm_gen = []
 
-        s = time.process_time()
-        for frame in self.csm.generate(text=message, speaker=0, context=csm_ctx):
+        for frame in self.csm.generate(text=message, speaker=0, context=csm_ctx, temperature=0.9):
             if len(csm_gen) == 0:
                 e = time.process_time()
                 print(f"CSM in {(e-s)*1000}ms (first frame)")
-                print(f"TTFF {(e-true_start)*1000}ms")
+                print(f"TTFF {(e-true_start)*1000}ms\n")
 
-            csm_gen.append(frame)
+            csm_gen.append(frame.cpu())
             frame = frame.unsqueeze(0).cpu().numpy()
             yield (24000, frame)
 
         self.llm_ctx.append({"role": "assistant", "content": message})
-        self.csm_ctx.append(Segment(text=message, speaker=0, audio=torch.cat(csm_gen)))
 
-    def input_paused(self, threshold_ms: float = 600) -> bool:
-        if self.paused_at is None:
-            return False
+        csm_gen = torch.cat(csm_gen)
+        self.csm_ctx.append(Segment(text=message, speaker=0, audio=csm_gen))
 
-        elapsed_ms = (time.process_time() - self.paused_at) * 1000
-
-        return elapsed_ms > threshold_ms
-
-    # returns True if a new speech chunk was buffered, and False otherwise
-    def buffer_frame_with_vad(self, audio: tuple[int, np.ndarray]) -> bool:
-        rate, frame = audio
-        self.rx_buf = np.concatenate((self.rx_buf, np.squeeze(frame)))
-
-        # min_silence_duration of 0 ensures we can discard the rest without problems
-        ts = get_speech_timestamps(self.rx_buf, self.vad, min_speech_duration_ms=150, min_silence_duration_ms=0)
-
-        if len(ts) > 0:
-            # stopped speaking? flush and clear buffer
-            if ts[-1]['end'] != len(self.rx_buf):
-                for i in ts:
-                    self.sp_buf.append(self.rx_buf[i['start'] : i['end']])
-                self.rx_buf = np.empty(0, dtype=np.float32)
-                self.paused_at = time.process_time()
-                return True
-            else:
-                self.paused_at = None
-        # prune a frame if silence is too long (last bit may be the start of some unrecognized speech)
-        elif (len(self.rx_buf) / rate) >= 0.5:
-            self.rx_buf = self.rx_buf[len(frame):]
-
-        return False
+        # torchaudio.save("last.wav", csm_gen.unsqueeze(0), 24000)
 
     def emit(self) -> None:
-        paused = self.input_paused()
+        if self.flight is None:
+            return None
 
-        if paused:
-            try:
-                return self.queued.get_nowait()
-            except Empty:
-                pass
-
-        if self.flight is not None:
-            try:
-                item = next(self.flight)
-                if paused:
-                    return item
-                else:
-                    self.queued.put(item)
-            except StopIteration:
-                super().reset()
-                self.flight = None
+        try:
+            return next(self.flight)
+        except StopIteration:
+            super().reset()
+            self.flight = None
 
     def copy(self) -> StreamHandler:
-        return Chat(self.vad, self.stt, self.llm, self.csm, llm_model=self.llm_model, system=self.system)
+        return Chat(self.stt, self.llm, self.csm, llm_model=self.llm_model, system=self.system)
 
     def start_up(self) -> None: # called on stream start
         pass
@@ -213,22 +251,24 @@ class Chat(StreamHandler):
     def shutdown(self) -> None: # called on stream close
         pass
 
+
 def stderr(msg):
     sys.stderr.write(msg)
     sys.stderr.flush()
 
-if __name__ == "__main__":
-    # VAD: figure out if you're talking
-    vad = load_silero_vad()
 
+if __name__ == "__main__":
     # STT: figure out tf you said
     # https://github.com/Codeblockz/distil-whisper-FastRTC?tab=readme-ov-file#available-models
-    stt = get_stt_model("distil-whisper/distil-small.en", device="cuda", dtype="float16")
+    stt = DistilWhisperSTT(model="distil-whisper/distil-small.en", device="cuda", dtype="float16")
+    stderr(click.style("INFO", fg="green") + ":\t  Warming up STT model.\n")
+    stt.stt((16000, load_audio_file("shelly_48.wav", rate=16000).cpu().numpy()))
+    stderr(click.style("INFO", fg="green") + ":\t  STT model warmed up.\n")
 
     # LLM: figure out what to say
     # TODO: warmup (ctx caching)
-    api_key  = os.environ.get("OPENAI_API_KEY")  or "eyy_lmao"
-    api_base = os.environ.get("OPENAI_BASE_URL") or "http://127.0.0.1:8000/v1"
+    api_key   = os.environ.get("OPENAI_API_KEY")  or "eyy_lmao"
+    api_base  = os.environ.get("OPENAI_BASE_URL") or "http://127.0.0.1:8000/v1"
     llm = OpenAI(api_key=api_key, base_url=api_base)
 
     # CSM: figure out how to say it
@@ -237,19 +277,20 @@ if __name__ == "__main__":
     list(csm.generate(text="Warming up CSM!", speaker=0, context=bootleg_maya))
     stderr(click.style("INFO", fg="green") + ":\t  CSM model warmed up.\n")
 
-    with open("maya.md", "r") as f:
+    with open("maya-opt.md", "r") as f:
         system = f.read()
 
     # gg
-    chat = Chat(vad, stt, llm, csm, llm_model="co-2", system=system)
+    api_model = os.environ.get("OPENAI_MODEL")    or "co-2"
+    chat = Chat(stt, llm, csm, llm_model=api_model, system=system)
 
     # TODO: gradio shit
     #
     # with gr.Blocks() as ui:
-    #     with gr.Column():
-    #         with gr.Group():
-    #             audio = WebRTC(mode="send-receive", modality="audio")
-    #             audio.stream(fn=chat, inputs=[audio], outputs=[audio])
+    #    with gr.Column():
+    #        with gr.Group():
+    #            audio = WebRTC(mode="send-receive", modality="audio")
+    #            audio.stream(fn=chat, inputs=[audio], outputs=[audio])
     # ui.launch()
 
     stream = Stream(handler=chat, modality="audio", mode="send-receive")

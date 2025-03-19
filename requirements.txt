@@ -1,5 +1,5 @@
 # fastrtc
-fastrtc[vad, stt, tts]==0.0.15
+fastrtc==0.0.15
 gradio
 
 # transcription
